@@ -1,0 +1,746 @@
+-- DxckkyPray | Murder Mystery 2 | Coin Farm
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local VirtualUser = game:GetService("VirtualUser")
+local player = Players.LocalPlayer
+local env = getgenv and getgenv() or _G
+local runtimeKey = "__DxckkyPrayMM2CoinFarm"
+
+local uiUrl = "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+local WindUI = assert(loadstring(game:HttpGet(uiUrl)))()
+local old = env[runtimeKey]
+if old then old:destroy() end
+
+local window = WindUI:CreateWindow({
+    Title = "DxckkyPray - Murder Mystery 2",
+    Theme = "Rose",
+    Folder = "DxckkyPray_MM2",
+    Size = UDim2.fromOffset(520, 420),
+    SideBarWidth = 200,
+    ToggleKey = Enum.KeyCode.RightShift,
+    Draggable = true,
+    ScrollBarEnabled = true,
+    Background = "rbxassetid://82503368188240",
+    BackgroundImageTransparency = 0.6,
+    OpenButton = {
+        Title = "Open DxckkyPray",
+        CornerRadius = UDim.new(1, 0),
+        StrokeThickness = 2,
+        Enabled = true,
+        Draggable = true,
+        OnlyMobile = false,
+        Color = ColorSequence.new(Color3.fromHex("#ff0000"), Color3.fromHex("#b50000")),
+    },
+})
+local tab = window:Tab({Title = "Farm", Icon = "coins"})
+local statusLabel = tab:Paragraph({Title = "Coin Farm", Desc = "Disabled", Icon = "coins"})
+
+local farm = {
+    alive = true, enabled = false, generation = 0,
+    mode = "CFrame", position = "Normal", speed = 28,
+    antiAfk = true, reduceRendering = false,
+    coins = {}, retry = setmetatable({}, {__mode = "k"}),
+    bags = {}, connections = {}, total = 0,
+}
+env[runtimeKey] = farm
+
+local function status(message)
+    local description = message .. "\nCollected: " .. farm.total
+    if description ~= farm.status then
+        farm.status = description
+        statusLabel:SetDesc(description)
+    end
+end
+
+local function connect(signal, callback)
+    table.insert(farm.connections, signal:Connect(callback))
+end
+
+local function updateRendering()
+    local reduce = farm.alive and farm.enabled and farm.reduceRendering
+    if reduce and farm.previousRendering == nil then
+        local readOk, enabled = pcall(function()
+            return RunService:Is3dRenderingEnabled()
+        end)
+        local setOk = pcall(function()
+            RunService:Set3dRenderingEnabled(false)
+        end)
+        if setOk then
+            farm.previousRendering = not readOk or enabled ~= false
+        else
+            WindUI:Notify({
+                Title = "Reduce 3D Rendering",
+                Content = "3D rendering controls are unavailable in this executor.",
+                Duration = 3,
+            })
+        end
+    elseif not reduce and farm.previousRendering ~= nil then
+        local restored = pcall(function()
+            RunService:Set3dRenderingEnabled(farm.previousRendering)
+        end)
+        if restored then farm.previousRendering = nil end
+    end
+end
+
+connect(player.Idled, function()
+    if not farm.alive or not farm.enabled or not farm.antiAfk then return end
+    local now = os.clock()
+    if now - (farm.lastIdleInput or -math.huge) < 30 then return end
+    farm.lastIdleInput = now
+    local camera = workspace.CurrentCamera
+    local view = camera and camera.CFrame or CFrame.new()
+    local sent = pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:Button2Down(Vector2.zero, view)
+    end)
+    if sent then
+        task.delay(0.1, function()
+            pcall(function() VirtualUser:Button2Up(Vector2.zero, view) end)
+        end)
+    end
+end)
+
+local function bagContainer()
+    local gui = player:FindFirstChildOfClass("PlayerGui")
+    local main = gui and gui:FindFirstChild("MainGUI")
+    local gameGui = main and main:FindFirstChild("Game")
+    local bags = gameGui and gameGui:FindFirstChild("CoinBags")
+    return bags and bags:FindFirstChild("Container")
+end
+
+local function currency(coin)
+    local visual = coin:FindFirstChild("CoinVisual")
+    local id = coin:GetAttribute("CoinID") or (visual and visual:GetAttribute("CoinID"))
+    if type(id) == "string" and id ~= "" then return id end
+    local kind = coin.Name:match("^(.+)_Server$")
+    if kind then
+        local container = bagContainer()
+        if kind == "Coin" or kind == "Candy" or (container and container:FindFirstChild(kind)) then
+            return kind
+        end
+    end
+end
+
+local function track(part)
+    if not farm.enabled or not part:IsA("BasePart") then return end
+    local coin = part
+    if part.Name == "CoinVisual" or CollectionService:HasTag(part, "CoinVisual") then
+        local parent = part.Parent
+        if parent and parent:IsA("BasePart") and parent.Name:match("_Server$") then
+            coin = parent
+            farm.coins[part] = nil
+        end
+    elseif not part.Name:match("_Server$") then
+        return
+    end
+    if currency(coin) then
+        farm.coins[coin] = true
+    end
+end
+
+local function indexCoins()
+    for _, part in ipairs(workspace:GetDescendants()) do track(part) end
+end
+
+local function visiblePart(part)
+    return part:IsA("BasePart") and part.Transparency < 0.99
+        and part.LocalTransparencyModifier < 0.99
+end
+
+local function available(coin)
+    if not coin:IsDescendantOf(workspace) or coin:GetAttribute("Collected") == true
+        or coin:GetAttribute("Delete") == true or coin:GetAttribute("RoundEnd") == true then
+        return false
+    end
+    local lobby = workspace:FindFirstChild("Lobby")
+    if lobby and coin:IsDescendantOf(lobby) then return false end
+    local visual = coin:FindFirstChild("CoinVisual")
+    if not visual and CollectionService:HasTag(coin, "CoinVisual") then visual = coin end
+    if not visual then return true end
+    if visual:GetAttribute("Collected") == true then return false end
+    if visiblePart(visual) then return true end
+    for _, part in ipairs(visual:GetDescendants()) do
+        if visiblePart(part) then return true end
+    end
+    return false
+end
+
+local function bagFor(kind)
+    local container = bagContainer()
+    return container and container:FindFirstChild(kind)
+end
+
+local function bagFull(kind)
+    local data = farm.bags[kind]
+    if data and data.limit and data.count >= data.limit then return true end
+    local bag = bagFor(kind)
+    local full = bag and bag:FindFirstChild("Full")
+    return bag and bag:IsA("GuiObject") and bag.Visible
+        and full and full:IsA("GuiObject") and full.Visible
+end
+
+local function playerRoundData(target)
+    local roles = farm.roles
+    return roles and (roles[target.Name] or roles[tostring(target.UserId)] or roles[target.UserId])
+end
+
+local function inRound()
+    if farm.roundActive == false then return false end
+    local own = playerRoundData(player)
+    if type(own) == "table" then
+        return own.Dead ~= true and own.Role ~= "Spectator" and own.Role ~= "Lobby"
+    end
+    if farm.roles and next(farm.roles) ~= nil then return false end
+    local container = bagContainer()
+    if container then
+        for _, bag in ipairs(container:GetChildren()) do
+            if bag:IsA("GuiObject") and bag.Visible then return true end
+        end
+    end
+    return false
+end
+
+local function characterParts()
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart")
+        and character:IsDescendantOf(workspace) then
+        return character, root, humanoid
+    end
+end
+
+local function stopTween(travel)
+    if travel.tween then
+        travel.tween:Cancel()
+        travel.tween:Destroy()
+        travel.tween = nil
+    end
+end
+
+local function stopTravel()
+    local travel = farm.travel
+    if not travel then return end
+    farm.travel = nil
+    stopTween(travel)
+    if travel.added then travel.added:Disconnect() end
+    if travel.physics then travel.physics:Disconnect() end
+    if travel.under and travel.root.Parent == player.Character
+        and travel.humanoid.Health > 0
+        and (travel.root.Position - travel.lastPosition).Magnitude <= 12 then
+        travel.root.CFrame = travel.surface
+        travel.root.AssemblyLinearVelocity = Vector3.zero
+        travel.root.AssemblyAngularVelocity = Vector3.zero
+    end
+    if travel.stabilizer then travel.stabilizer:Destroy() end
+    for part, original in pairs(travel.parts) do
+        if part.Parent then
+            part.CanCollide = original.collide
+            if original.massless ~= nil then part.Massless = original.massless end
+        end
+    end
+end
+
+local function beginTravel(character, root, humanoid)
+    local travel = farm.travel
+    local under = farm.position == "Under"
+    if travel and travel.root == root and travel.under == under then return travel end
+    stopTravel()
+    travel = {
+        root = root, humanoid = humanoid, under = under, parts = {},
+        lastPosition = root.Position, surface = root.CFrame,
+    }
+    farm.travel = travel
+
+    local function trackPart(part)
+        if not part:IsA("BasePart") or travel.parts[part] then return end
+        local original = {collide = part.CanCollide}
+        if part:FindFirstAncestorWhichIsA("Tool") then original.massless = part.Massless end
+        travel.parts[part] = original
+        part.CanCollide = false
+        if original.massless ~= nil then part.Massless = true end
+    end
+    for _, part in ipairs(character:GetDescendants()) do trackPart(part) end
+    travel.added = character.DescendantAdded:Connect(trackPart)
+    travel.physics = RunService.PreSimulation:Connect(function()
+        for part, original in pairs(travel.parts) do
+            if part:IsDescendantOf(character) then
+                if part.CanCollide then part.CanCollide = false end
+                if original.massless ~= nil and not part.Massless then part.Massless = true end
+            else
+                if part.Parent then
+                    part.CanCollide = original.collide
+                    if original.massless ~= nil then part.Massless = original.massless end
+                end
+                travel.parts[part] = nil
+            end
+        end
+    end)
+    if under then
+        local support = Instance.new("BodyVelocity")
+        support.Name = "DxckkyPrayCoinStabilizer"
+        support.Velocity = Vector3.zero
+        support.MaxForce = Vector3.new(0, 9e9, 0)
+        support.P = 90000
+        support.Parent = root
+        travel.stabilizer = support
+    end
+    return travel
+end
+
+local function underTarget(character, root, coin)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character, coin}
+    params.RespectCanCollide = true
+    local origin = coin.Position - Vector3.new(0, coin.Size.Y / 2 + 0.05, 0)
+    local floor = workspace:Raycast(origin, Vector3.new(0, -20, 0), params)
+        or workspace:Raycast(coin.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, -24, 0), params)
+    if not floor then return end
+
+    local underside = floor.Position.Y
+    local part = floor.Instance
+    if part:IsA("BasePart") then
+        -- Probe upward through only the floor we hit, so a thick slab uses its lower face.
+        local up = RaycastParams.new()
+        up.FilterType = Enum.RaycastFilterType.Include
+        up.FilterDescendantsInstances = {part}
+        up.RespectCanCollide = true
+        local size, frame = part.Size, part.CFrame
+        local halfHeight = (math.abs(frame.RightVector.Y) * size.X
+            + math.abs(frame.UpVector.Y) * size.Y + math.abs(frame.LookVector.Y) * size.Z) / 2
+        local bottom = part.Position.Y - halfHeight
+        local depth = floor.Position.Y - bottom + 0.5
+        if depth > 0 and depth <= 64 then
+            local hit = workspace:Raycast(floor.Position - Vector3.new(0, depth, 0), Vector3.new(0, depth + 1, 0), up)
+            if hit then underside = hit.Position.Y end
+        end
+    end
+    local head = character:FindFirstChild("Head")
+    local topOffset = head and head:IsA("BasePart") and head.Position.Y + head.Size.Y / 2 - root.Position.Y or 2
+    local target = Vector3.new(coin.Position.X, underside - math.clamp(topOffset, 1, 5) - 1.5, coin.Position.Z)
+    local surface = CFrame.new(coin.Position + Vector3.new(0, 2, 0))
+    return target, surface
+end
+
+local function cancel()
+    farm.generation += 1
+    stopTravel()
+end
+
+local function resetRound(active, roles)
+    cancel()
+    farm.roundActive = active
+    farm.roles = roles
+    farm.roundSerial = (farm.roundSerial or 0) + 1
+    farm.endRequest = nil
+    farm.wasPlaying = false
+    farm.lastRole = nil
+    farm.playingCharacter = nil
+    table.clear(farm.bags)
+    table.clear(farm.retry)
+    farm.contact = nil
+end
+
+connect(workspace.DescendantAdded, track)
+connect(workspace.DescendantRemoving, function(part) farm.coins[part] = nil end)
+connect(CollectionService:GetInstanceAddedSignal("CoinVisual"), track)
+connect(player.CharacterRemoving, cancel)
+
+task.spawn(function()
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+    local gameplay = remotes and remotes:WaitForChild("Gameplay", 10)
+    if not farm.alive then return end
+    local function listen(name, callback)
+        local event = gameplay and gameplay:FindFirstChild(name)
+        if event and event:IsA("RemoteEvent") then connect(event.OnClientEvent, callback) end
+    end
+    listen("RoundStart", function(_, roles)
+        resetRound(true, type(roles) == "table" and roles or nil)
+    end)
+    listen("CoinsStarted", function()
+        table.clear(farm.bags)
+        table.clear(farm.retry)
+        if farm.enabled then indexCoins() end
+    end)
+    for _, name in ipairs({"LoadingMap", "VictoryScreen", "GameOver", "RoundEndFade"}) do
+        listen(name, function() resetRound(false) end)
+    end
+    listen("PlayerDataChanged", function(roles)
+        if type(roles) ~= "table" then return end
+        if next(roles) == nil then
+            resetRound(false)
+        else
+            farm.roles = roles
+        end
+    end)
+    listen("CoinCollected", function(kind, first, second)
+        if type(kind) ~= "string" or kind == "" then return end
+        local count, limit = tonumber(first), tonumber(second)
+        if count and limit and limit > 0 then farm.bags[kind] = {count = count, limit = limit} end
+        local contact = farm.contact
+        if farm.enabled and contact and contact.kind == kind and os.clock() - contact.time < 1.5 then
+            farm.retry[contact.coin] = math.huge
+            farm.contact = nil
+            farm.total += 1
+        end
+    end)
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local roundModule = modules and modules:FindFirstChild("CurrentRoundClient")
+    if roundModule and roundModule:IsA("ModuleScript") then
+        local ok, round = pcall(require, roundModule)
+        if farm.alive and farm.roundActive == nil and farm.roles == nil
+            and ok and type(round) == "table" and type(round.PlayerData) == "table" then
+            farm.roles = round.PlayerData
+        end
+    end
+end)
+
+local function nearestCoin(root)
+    local nearest, distance = nil, math.huge
+    local now = os.clock()
+    local full = {}
+    for coin in pairs(farm.coins) do
+        local kind = currency(coin)
+        if kind and full[kind] == nil then full[kind] = bagFull(kind) == true end
+        if kind and not full[kind] and (farm.retry[coin] or 0) <= now and available(coin) then
+            local current = (coin.Position - root.Position).Magnitude
+            if current < distance then nearest, distance = coin, current end
+        end
+    end
+    return nearest
+end
+
+local function collect(character, root, humanoid, coin)
+    local generation = farm.generation
+    local kind = currency(coin)
+    local function valid()
+        return farm.alive and farm.enabled and farm.generation == generation
+            and player.Character == character and root.Parent == character and humanoid.Health > 0
+            and inRound() and not bagFull(kind) and available(coin)
+    end
+    if not valid() then return end
+    if farm.position == "Under" and type(firetouchinterest) ~= "function" then
+        status("Under mode requires touch support")
+        return
+    end
+
+    local target, surface = coin.Position, nil
+    if farm.position == "Under" then
+        target, surface = underTarget(character, root, coin)
+        if not target then
+            farm.retry[coin] = os.clock() + 2
+            status("Waiting for floor below " .. kind:lower())
+            return
+        end
+    end
+    local travel = beginTravel(character, root, humanoid)
+
+    status("Collecting " .. kind:lower())
+    if farm.mode == "Tween" then
+        local duration = math.max((target - root.Position).Magnitude / farm.speed, 0.02)
+        travel.tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = CFrame.new(target)})
+        travel.tween:Play()
+        while valid() and travel.tween.PlaybackState == Enum.PlaybackState.Playing do
+            RunService.Heartbeat:Wait()
+            if farm.travel == travel then travel.lastPosition = root.Position end
+        end
+    else
+        local deadline = os.clock() + (target - root.Position).Magnitude / farm.speed + 3
+        while valid() and os.clock() < deadline do
+            local dt = RunService.Heartbeat:Wait()
+            if not valid() then break end
+            local delta = target - root.Position
+            if delta.Magnitude <= 2.25 then break end
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = CFrame.new(root.Position + delta.Unit * math.min(delta.Magnitude, farm.speed * math.min(dt, 0.12)))
+            travel.lastPosition = root.Position
+        end
+    end
+    if farm.travel ~= travel then return end
+    stopTween(travel)
+    if valid() and (target - root.Position).Magnitude <= 3 then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(target)
+        travel.lastPosition = target
+        if surface then travel.surface = surface end
+        farm.contact = {coin = coin, kind = kind, time = os.clock()}
+        for _ = 1, 2 do
+            if not valid() or not farm.contact then break end
+            root.CFrame = CFrame.new(target)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            if type(firetouchinterest) == "function" then
+                local head = character:FindFirstChild("Head")
+                for _, part in ipairs({root, head}) do
+                    if part:IsA("BasePart") then
+                        pcall(firetouchinterest, part, coin, 0)
+                        pcall(firetouchinterest, part, coin, 1)
+                    end
+                end
+            end
+            task.wait(0.3)
+        end
+        if farm.generation == generation and (farm.retry[coin] or 0) < math.huge then
+            farm.retry[coin] = os.clock() + 1.5
+        end
+    elseif valid() then
+        farm.retry[coin] = os.clock() + 2
+    end
+end
+
+local function fullBag()
+    for kind in pairs(farm.bags) do
+        if bagFull(kind) then return true end
+    end
+    local container = bagContainer()
+    if container then
+        for _, bag in ipairs(container:GetChildren()) do
+            if bag:IsA("GuiObject") and bag.Visible and bagFull(bag.Name) then return true end
+        end
+    end
+    return false
+end
+
+local function roundTarget(root, wantMurderer)
+    local nearest, distance = nil, math.huge
+    for _, target in ipairs(Players:GetPlayers()) do
+        local data = playerRoundData(target)
+        local character = target.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local targetRoot = character and character:FindFirstChild("HumanoidRootPart")
+        if target ~= player and type(data) == "table" and data.Dead ~= true
+            and ((wantMurderer and data.Role == "Murderer")
+                or (not wantMurderer and (data.Role == "Innocent" or data.Role == "Sheriff" or data.Role == "Hero")))
+            and humanoid and humanoid.Health > 0 and targetRoot and targetRoot:IsA("BasePart") then
+            local gap = (targetRoot.Position - root.Position).Magnitude
+            if gap < distance then nearest, distance = targetRoot, gap end
+        end
+    end
+    return nearest
+end
+
+local function equip(character, humanoid, name)
+    local backpack = player:FindFirstChildOfClass("Backpack")
+    local tool = character:FindFirstChild(name) or (backpack and backpack:FindFirstChild(name))
+    if not tool or not tool:IsA("Tool") then return end
+    if tool.Parent ~= character then
+        humanoid:EquipTool(tool)
+        task.wait(0.15)
+    end
+    if tool.Parent == character then return tool end
+end
+
+local function endingValid(request, character, humanoid)
+    return farm.alive and farm.enabled and farm.autoEndRound and farm.endRequest == request
+        and farm.roundActive ~= false and player.Character == character and humanoid.Health > 0
+end
+
+local function endRoundAction(request, character, root, humanoid)
+    local knife = not request.died and request.role == "Murderer"
+    local gun = not request.died and (request.role == "Sheriff" or request.role == "Hero")
+    local target = roundTarget(root, not knife)
+    if not target then return end
+    if knife then
+        local tool = equip(character, humanoid, "Knife")
+        if not tool or not endingValid(request, character, humanoid) or not target.Parent then return end
+        local stab = tool:FindFirstChild("Stab")
+        local events = tool:FindFirstChild("Events")
+        local stabbed = events and events:FindFirstChild("KnifeStabbed")
+        root.CFrame = target.CFrame * CFrame.new(0, 0, 2)
+        tool:Activate()
+        if stab and stab:IsA("RemoteEvent") then stab:FireServer("Slash")
+        elseif stabbed and stabbed:IsA("RemoteEvent") then stabbed:FireServer() end
+    elseif gun then
+        local tool = equip(character, humanoid, "Gun")
+        if not tool or not endingValid(request, character, humanoid) or not target.Parent then return end
+        local shoot = tool:FindFirstChild("Shoot", true)
+        if shoot and shoot:IsA("RemoteEvent") then
+            local position = target.Position
+            shoot:FireServer(CFrame.new(position + Vector3.new(0, 1.2, 0)), CFrame.new(position))
+        end
+    else
+        local origin = root.CFrame
+        local deadline = os.clock() + 0.45
+        local ok, err = pcall(function()
+            while endingValid(request, character, humanoid) and target.Parent and os.clock() < deadline do
+                root.CFrame = target.CFrame * CFrame.new(0, 0.5, 0)
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.new(10000, 10000, 10000)
+                RunService.Heartbeat:Wait()
+            end
+        end)
+        if root.Parent == character then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            if farm.roundActive ~= false and farm.roundSerial == request.roundSerial and humanoid.Health > 0 then
+                root.CFrame = origin
+            end
+        end
+        if not ok then error(err) end
+    end
+end
+
+local function endRoundStep(character, root, humanoid, playing)
+    local own = playerRoundData(player)
+    if playing then
+        farm.wasPlaying = true
+        farm.playingCharacter = character
+        farm.lastRole = type(own) == "table" and own.Role or farm.lastRole
+    end
+    if not farm.autoEndRound or farm.roundActive == false then return false end
+
+    local died = farm.wasPlaying and not playing
+        and (character == nil or (type(own) == "table" and own.Dead == true))
+    local request = farm.endRequest
+    if not request then
+        if not died and (not playing or not fullBag()) then return false end
+        cancel()
+        request = {role = farm.lastRole, died = died, attempts = 0, nextAt = 0, roundSerial = farm.roundSerial}
+        if died then request.deadCharacter = farm.playingCharacter end
+        farm.endRequest = request
+    elseif died and not request.died then
+        request.died = true
+        request.deadCharacter = farm.playingCharacter
+        request.attempts = 0
+        request.nextAt = 0
+    end
+
+    if not character or (request.died and character == request.deadCharacter) then
+        status("Waiting for respawn to end round")
+        return true
+    end
+    if request.role ~= "Murderer" and request.role ~= "Sheriff"
+        and request.role ~= "Hero" and request.role ~= "Innocent" then
+        status("Waiting for this mode to end")
+        return true
+    end
+    local maxAttempts = request.role == "Murderer" and not request.died and 8 or 3
+    if request.attempts >= maxAttempts then
+        status("Waiting for round result")
+        return true
+    end
+    if os.clock() >= request.nextAt then
+        request.attempts += 1
+        request.nextAt = os.clock() + 1.2
+        status("Ending round")
+        local ok, err = pcall(endRoundAction, request, character, root, humanoid)
+        if not ok then warn("[DxckkyPray] " .. tostring(err)) end
+    end
+    return true
+end
+
+tab:Toggle({
+    Title = "Auto Coin Farm", Value = false,
+    Callback = function(value)
+        farm.enabled = value == true
+        cancel()
+        updateRendering()
+        if farm.enabled then
+            indexCoins()
+        else
+            table.clear(farm.coins)
+            farm.contact = nil
+            farm.endRequest = nil
+            farm.wasPlaying = false
+            status("Disabled")
+        end
+    end,
+})
+tab:Dropdown({
+    Title = "Movement", Values = {"CFrame", "Tween"}, Value = farm.mode,
+    Callback = function(value)
+        if value ~= "CFrame" and value ~= "Tween" then return end
+        farm.mode = value
+        cancel()
+    end,
+})
+tab:Dropdown({
+    Title = "Position", Values = {"Normal", "Under"}, Value = farm.position,
+    Callback = function(value)
+        if value ~= "Normal" and value ~= "Under" then return end
+        farm.position = value
+        cancel()
+    end,
+})
+tab:Slider({
+    Title = "Speed", Value = {Min = 10, Max = 60, Default = farm.speed}, Step = 1, Suffix = "studs/s",
+    Callback = function(value)
+        farm.speed = math.clamp(tonumber(value) or 28, 10, 60)
+        cancel()
+    end,
+})
+tab:Toggle({
+    Title = "Anti AFK", Value = true, Desc = "Active while Auto Coin Farm is on.",
+    Callback = function(value) farm.antiAfk = value == true end,
+})
+tab:Toggle({
+    Title = "Auto End Round After Full Bag or Death", Value = false,
+    Callback = function(value)
+        farm.autoEndRound = value == true
+        if not farm.autoEndRound then farm.endRequest = nil end
+    end,
+})
+tab:Toggle({
+    Title = "Reduce 3D Rendering", Value = false, Desc = "Pause 3D rendering during Auto Coin Farm.",
+    Callback = function(value)
+        farm.reduceRendering = value == true
+        updateRendering()
+    end,
+})
+tab:Button({
+    Title = "Hide Menu", Desc = "Reopen with Open DxckkyPray or Right Shift.",
+    Callback = function() window:Close() end,
+})
+
+function farm:destroy(windowAlreadyDestroyed)
+    if not self.alive then return end
+    self.alive = false
+    self.enabled = false
+    cancel()
+    updateRendering()
+    for _, connection in ipairs(self.connections) do connection:Disconnect() end
+    if env[runtimeKey] == self then env[runtimeKey] = nil end
+    if not windowAlreadyDestroyed and type(window.Destroy) == "function" then window:Destroy() end
+end
+
+if type(window.OnDestroy) == "function" then
+    window:OnDestroy(function() farm:destroy(true) end)
+end
+
+task.spawn(function()
+    while farm.alive do
+        if farm.enabled then
+            local character, root, humanoid = characterParts()
+            local playing = character ~= nil and inRound()
+            if endRoundStep(character, root, humanoid, playing) then
+                -- Let the end-round action finish before resuming coin movement.
+            elseif not playing then
+                stopTravel()
+                status("Waiting for round")
+            else
+                local coin = nearestCoin(root)
+                if coin then
+                    local ok, err = pcall(collect, character, root, humanoid, coin)
+                    if not ok then
+                        cancel()
+                        farm.retry[coin] = os.clock() + 5
+                        status("Coin collection failed")
+                        warn("[DxckkyPray] " .. tostring(err))
+                    end
+                elseif fullBag() then
+                    stopTravel()
+                    status("Bag full - waiting for next round")
+                else
+                    if farm.position ~= "Under" then stopTravel() end
+                    status("Waiting for coins")
+                end
+            end
+        end
+        task.wait(0.2)
+    end
+end)
